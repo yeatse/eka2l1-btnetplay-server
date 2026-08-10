@@ -1,0 +1,30 @@
+services:
+  btnetplay:
+    build:
+      context: .
+    container_name: btnetplay
+    # Host networking on purpose: the server's only job is to report the public
+    # address a client connected from, and Docker's IPv6 userland proxy would
+    # replace every peer address with the bridge gateway.
+    network_mode: host
+    environment:
+      BTNETPLAY_HOST: "::"
+      BTNETPLAY_PORT: "27138"
+      BTNETPLAY_LOG_LEVEL: info
+      # Testing aid: BTNETPLAY_ALLOW_SAME_ADDRESS=1 docker compose up -d
+      BTNETPLAY_ALLOW_SAME_ADDRESS: "${BTNETPLAY_ALLOW_SAME_ADDRESS:-0}"
+    healthcheck:
+      test:
+        - CMD
+        - python3
+        - -c
+        - "import socket; socket.create_connection(('127.0.0.1', 27138), 5).close()"
+      interval: 60s
+      timeout: 10s
+      retries: 3
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "5"
+    restart: unless-stopped
