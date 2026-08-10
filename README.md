@@ -4,12 +4,20 @@ A rendezvous server for [EKA2L1](https://github.com/EKA2L1/EKA2L1)'s *proxy
 server* Bluetooth netplay discovery mode — the mode where every emulator holds a
 TCP connection to one central host that introduces players to each other.
 
-The emulator ships with a default server address but no server implementation,
-so this is a clean-room one, written against the emulator's client code. It
-carries no game traffic: it only tells each client the public IP addresses of the
-other clients that logged in with the same password. Everything after that —
+It carries no game traffic: it only tells each client the public IP addresses of
+the other clients that logged in with the same password. Everything after that —
 device name queries, virtual Bluetooth address queries, L2CAP/RFCOMM payloads —
 goes directly peer to peer over UDP.
+
+## Why this exists when EKA2L1/btnet-server does
+
+[`EKA2L1/btnet-server`](https://github.com/EKA2L1/btnet-server) implements the
+protocol the emulator used in August 2022: ASCII `l0`/`l1`/`cr` over TCP, with
+the server pushing the requester's address to the other peers over UDP. In March
+2023 the emulator was rewritten onto the binary opcode protocol documented below
+and the server was never updated, so the two have not been able to talk to each
+other since. This server implements what the emulator actually sends today,
+written against its client code.
 
 ## Running it
 
