@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
 """Smoke test for the Bluetooth netplay matching server.
 
-Speaks the emulator's wire protocol from several loopback source addresses, so
-that the server sees the test clients as distinct peers (it deliberately never
-reports a peer that shares the requester's address).
+Speaks the emulator's wire protocol from several loopback source addresses and
+also verifies that two peers sharing one address are distinguished by their
+advertised discovery ports.
 
     python3 smoke-test.py [host] [port]
 """
 
 from __future__ import annotations
 
+import os
 import socket
 import sys
 import time
@@ -18,6 +19,7 @@ OPCODE_GET_PLAYERS = 0x04
 OPCODE_NOTIFY_PLAYER_EXISTENCE = 0x05
 OPCODE_SERVER_LOGIN = 0x09
 OPCODE_SERVER_LOGOUT = 0x0A
+OPCODE_SERVER_PORT_EXTENSION = 0x0B
 
 failures = 0
 
@@ -33,8 +35,12 @@ class Peer:
         self.sock.settimeout(5)
         self.sock.connect((target, port))
 
-    def login(self, password: bytes) -> None:
+    def login(self, password: bytes, udp_port: int | None = None) -> None:
         self.sock.sendall(bytes([OPCODE_SERVER_LOGIN, len(password)]) + password)
+        capability = self.recv_exactly(2)
+        assert capability == bytes([OPCODE_SERVER_PORT_EXTENSION, 1]), f"bad capability {capability.hex()}"
+        if udp_port is not None:
+            self.sock.sendall(bytes([OPCODE_SERVER_PORT_EXTENSION]) + udp_port.to_bytes(2, "big"))
 
     def logout(self) -> None:
         self.sock.sendall(bytes([OPCODE_SERVER_LOGOUT]))
@@ -47,9 +53,14 @@ class Peer:
 
         found = []
         for _ in range(head[1]):
-            is_v4 = self.recv_exactly(1)[0]
+            address_type = self.recv_exactly(1)[0]
+            is_v4 = address_type in (1, 2)
             raw = self.recv_exactly(4 if is_v4 else 16)
-            found.append(socket.inet_ntop(socket.AF_INET if is_v4 else socket.AF_INET6, raw))
+            address = socket.inet_ntop(socket.AF_INET if is_v4 else socket.AF_INET6, raw)
+            if address_type in (2, 3):
+                port = int.from_bytes(self.recv_exactly(2), "big")
+                address = f"{address}:{port}"
+            found.append(address)
 
         return sorted(found)
 
@@ -142,6 +153,16 @@ def main() -> int:
 
     b.close()
     check_eventually("disconnect removes b", a.players, [])
+
+    same_a = Peer(host, port, "127.0.0.7")
+    same_b = Peer(host, port, "127.0.0.7")
+    same_a.login(b"same-address", 35689)
+    same_b.login(b"same-address", 35691)
+    same_address = os.environ.get("BTNETPLAY_SAME_ADDRESS_OVERRIDE", "127.0.0.7")
+    check("extended peers share an IP", same_a.players(), [f"{same_address}:35691"])
+    check("extended peer gets the other port", same_b.players(), [f"{same_address}:35689"])
+    same_a.close()
+    same_b.close()
 
     bad = Peer(host, port, "127.0.0.6")
     bad.sock.sendall(bytes([0x7F]))

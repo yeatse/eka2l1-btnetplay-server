@@ -14,15 +14,19 @@ Wire protocol (see src/emu/services/.../btmidman_proxserv_matching.cpp):
         0x09 <len:u8> <password bytes>      log in / join the room named by the password
         0x04                                 give me the other players in my room
         0x0A                                 log out
+        0x0B <port:u16>                      advertise UDP discovery port (new clients)
 
     server -> client
+        0x0B 0x01                            port-extension capability, after login
         0x05 <count:u8> <entry>*             the other players in the room
         entry := 0x01 <ipv4:4 bytes>         network byte order
                | 0x00 <ipv6:16 bytes>        network byte order
+               | 0x02 <ipv4:4> <port:u16>   extended entry, network byte order
+               | 0x03 <ipv6:16> <port:u16>  extended entry, network byte order
 
 The peer address is taken from the TCP connection, so a client never gets to
-declare where it lives. Its UDP listening port is not carried either: the
-emulator hardcodes HARBOUR_PORT (35689) for every friend it learns about here.
+declare where it lives. Current clients advertise only their UDP discovery port;
+legacy clients continue to use the fixed HARBOUR_PORT (35689).
 """
 
 from __future__ import annotations
@@ -34,12 +38,14 @@ import logging
 import os
 import signal
 import socket
+import struct
 import sys
 
 OPCODE_GET_PLAYERS = 0x04
 OPCODE_NOTIFY_PLAYER_EXISTENCE = 0x05
 OPCODE_SERVER_LOGIN = 0x09
 OPCODE_SERVER_LOGOUT = 0x0A
+OPCODE_SERVER_PORT_EXTENSION = 0x0B
 
 DEFAULT_PORT = 27138
 
@@ -72,7 +78,7 @@ log = logging.getLogger("btnetplay")
 
 
 class Client:
-    __slots__ = ("writer", "ip", "packed", "is_v4", "password", "registered", "logged_out", "tag")
+    __slots__ = ("writer", "ip", "packed", "is_v4", "password", "registered", "logged_out", "port", "tag")
 
     def __init__(self, writer: asyncio.StreamWriter, ip: ipaddress._BaseAddress, tag: str) -> None:
         self.writer = writer
@@ -84,6 +90,7 @@ class Client:
         # Set by an explicit logout, so that a later query does not silently put
         # the client back in a room it asked to leave.
         self.logged_out = False
+        self.port: int | None = None
         self.tag = tag
 
     def __repr__(self) -> str:  # pragma: no cover - logging only
@@ -91,11 +98,12 @@ class Client:
 
 
 class MatchingServer:
-    def __init__(self, allow_same_address: bool = False) -> None:
+    def __init__(self, allow_same_address: bool = False, same_address_override: ipaddress._BaseAddress | None = None) -> None:
         self.rooms: dict[bytes, list[Client]] = {}
         self.per_ip: dict[bytes, int] = {}
         self.total = 0
         self.allow_same_address = allow_same_address
+        self.same_address_override = same_address_override
 
     # -- room bookkeeping ---------------------------------------------------
 
@@ -140,21 +148,25 @@ class MatchingServer:
             return []
 
         room = self.rooms.get(client.password, ())
-        seen: set[bytes] = set() if self.allow_same_address else {client.packed}
+        seen: set[tuple[bytes, int | None]] = {(client.packed, client.port)}
         peers: list[Client] = []
 
         for other in room:
             if other is client:
                 continue
 
-            # Two emulators behind one public address cannot reach each other
-            # through this scheme anyway -- they would both want harbour port
-            # 35689 -- and handing a client its own address makes it call itself.
+            # Legacy clients cannot distinguish endpoints that share an address.
+            # Current clients can when they advertise different discovery ports.
+            endpoint = (other.packed, other.port)
             if not self.allow_same_address:
-                if other.packed in seen:
+                # Legacy clients cannot distinguish two peers at the same IP.
+                # Extended clients can, provided their advertised ports differ.
+                if other.packed == client.packed and (client.port is None or other.port is None):
+                    continue
+                if endpoint in seen:
                     continue
 
-                seen.add(other.packed)
+            seen.add(endpoint)
 
             peers.append(other)
 
@@ -168,11 +180,21 @@ class MatchingServer:
         entries = bytearray()
         count = 0
 
+        extended = client.port is not None
         for peer in peers:
             if count >= MAX_PLAYERS_IN_REPLY:
                 break
 
-            entry = (b"\x01" if peer.is_v4 else b"\x00") + peer.packed
+            advertised_ip = peer.ip
+            if self.same_address_override is not None and peer.ip == client.ip:
+                advertised_ip = self.same_address_override
+
+            if extended:
+                is_v4 = isinstance(advertised_ip, ipaddress.IPv4Address)
+                entry = (b"\x02" if is_v4 else b"\x03") + advertised_ip.packed + struct.pack("!H", peer.port or 35689)
+            else:
+                is_v4 = isinstance(advertised_ip, ipaddress.IPv4Address)
+                entry = (b"\x01" if is_v4 else b"\x00") + advertised_ip.packed
             if 2 + len(entries) + len(entry) > MAX_REPLY_SIZE:
                 break
 
@@ -182,6 +204,9 @@ class MatchingServer:
         if count < len(peers):
             log.info("%s: truncating player list to %d of %d", client, count, len(peers))
 
+        log.debug("%s: advertising %d extended=%s endpoint(s): %s", client, count, extended, [
+            (str(peer.ip), peer.port) for peer in peers[:count]
+        ])
         return bytes(bytearray([OPCODE_NOTIFY_PLAYER_EXISTENCE, count])) + bytes(entries)
 
     async def handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
@@ -276,6 +301,8 @@ class MatchingServer:
                 client.password = password
                 client.logged_out = False
                 self.register(client)
+                client.writer.write(bytes([OPCODE_SERVER_PORT_EXTENSION, 1]))
+                await client.writer.drain()
 
             elif opcode == OPCODE_GET_PLAYERS:
                 del pending[:1]
@@ -296,6 +323,18 @@ class MatchingServer:
                 del pending[:1]
                 client.logged_out = True
                 self.unregister(client)
+
+            elif opcode == OPCODE_SERVER_PORT_EXTENSION:
+                if len(pending) < 3:
+                    return True
+
+                port = struct.unpack("!H", pending[1:3])[0]
+                del pending[:3]
+                if port == 0:
+                    log.warning("%s: advertised invalid UDP port zero, dropping", client)
+                    return False
+                client.port = port
+                log.debug("%s: advertised UDP discovery port %d", client, port)
 
             else:
                 log.warning("%s: unknown opcode 0x%02X, dropping", client, opcode)
@@ -363,9 +402,18 @@ def make_listen_socket(host: str, port: int) -> socket.socket:
 
 
 async def amain(args: argparse.Namespace) -> int:
-    server_state = MatchingServer(allow_same_address=args.allow_same_address)
+    same_address_override = normalize_ip(args.same_address_override) if args.same_address_override else None
+    if args.same_address_override and same_address_override is None:
+        raise ValueError(f"invalid same-address override: {args.same_address_override!r}")
+
+    server_state = MatchingServer(
+        allow_same_address=args.allow_same_address,
+        same_address_override=same_address_override,
+    )
     if args.allow_same_address:
-        log.warning("reporting peers that share the requester's address (testing mode)")
+        log.info("reporting peers that share the requester's address")
+    if same_address_override is not None:
+        log.warning("rewriting same-address peers to %s (testing mode)", same_address_override)
 
     sock = make_listen_socket(args.host, args.port)
 
@@ -395,7 +443,12 @@ def main() -> int:
         "--allow-same-address",
         action="store_true",
         default=os.environ.get("BTNETPLAY_ALLOW_SAME_ADDRESS", "").lower() in ("1", "true", "yes"),
-        help="report peers that share the requester's public address; only useful for testing",
+        help="report peers that share the requester's public address, including legacy/duplicate endpoints",
+    )
+    parser.add_argument(
+        "--same-address-override",
+        default=os.environ.get("BTNETPLAY_SAME_ADDRESS_OVERRIDE", ""),
+        help="testing only: rewrite peers sharing the requester address to this IP",
     )
     args = parser.parse_args()
 

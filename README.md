@@ -4,7 +4,7 @@ A rendezvous server for [EKA2L1](https://github.com/EKA2L1/EKA2L1)'s *proxy
 server* Bluetooth netplay discovery mode — the mode where every emulator holds a
 TCP connection to one central host that introduces players to each other.
 
-It carries no game traffic: it only tells each client the public IP addresses of
+It carries no game traffic: it only tells each client the public IP endpoints of
 the other clients that logged in with the same password. Everything after that —
 device name queries, virtual Bluetooth address queries, L2CAP/RFCOMM payloads —
 goes directly peer to peer over UDP.
@@ -69,25 +69,30 @@ client -> server
     0x09 <len:u8> <password>     log in, joining the room named by the password
     0x04                          list the other players in my room
     0x0A                          log out
+    0x0B <port:u16>               advertise UDP discovery port (current clients)
 
 server -> client
+    0x0B 0x01                     port-extension capability, after login
     0x05 <count:u8> <entry>*
     entry := 0x01 <ipv4:4>        network byte order
            | 0x00 <ipv6:16>       network byte order
+           | 0x02 <ipv4:4> <port:u16>
+           | 0x03 <ipv6:16> <port:u16>
 ```
 
 A client's address comes from its TCP connection, never from the client itself.
-Its UDP port is not carried at all: the emulator hardcodes harbour port 35689
-for every peer it learns about here.
+Current clients advertise their UDP discovery port after the server capability
+message. Legacy clients remain compatible and use harbour port 35689.
 
 Two details are forced by the client and worth keeping in any reimplementation:
 
 - Replies are capped at 10 peers and 127 bytes. `MAX_INET_DEVICE_AROUND` is 10,
   and the emulator walks the reply with an 8-bit signed cursor that goes negative
   past 127 bytes — seven IPv6 entries are enough to hit that.
-- The server never reports a peer whose address equals the requester's. Both
-  would want harbour port 35689 on the same public address, so they cannot reach
-  each other anyway, and a client handed its own address calls itself.
+- By default, legacy peers sharing one address are filtered because they cannot
+  distinguish endpoints. Current peers with distinct advertised ports can share
+  one public address. `BTNETPLAY_ALLOW_SAME_ADDRESS=1` additionally disables the
+  legacy and duplicate-endpoint filter.
 
 Emulator builds without [the proxy-mode client
 fixes](https://github.com/yeatse/EKA2L1/blob/ios/docs/bluetooth-netplay-central-server.md)
@@ -117,14 +122,15 @@ device search then lists it by name.
 
 ```sh
 ufw allow 35689/udp                                  # only while testing
-BTNETPLAY_ALLOW_SAME_ADDRESS=1 docker compose up -d  # only while testing
+BTNETPLAY_ALLOW_SAME_ADDRESS=1 docker compose up -d
 python3 fake-peer.py --server <public ip> --password room --name "Fake Nokia"
 ```
 
-`BTNETPLAY_ALLOW_SAME_ADDRESS` switches off the same-address filter, which is
-what makes a test peer running on the server host visible to a client whose
-traffic also exits from that host. Turn both back off afterwards — the filter is
-correct behaviour in production.
+`BTNETPLAY_ALLOW_SAME_ADDRESS` switches off the remaining same-address and
+duplicate-endpoint filter. This deployment keeps it enabled so same-source
+clients are visible. `BTNETPLAY_SAME_ADDRESS_OVERRIDE` is a test-only escape
+hatch for a matching server and emulators that share one host; it must not be set
+for normal production traffic.
 
 ## Configuration
 
@@ -133,7 +139,8 @@ correct behaviour in production.
 | `BTNETPLAY_HOST` | `::` | Bind address; `::` means dual-stack |
 | `BTNETPLAY_PORT` | `27138` | TCP port the emulator expects |
 | `BTNETPLAY_LOG_LEVEL` | `info` | `debug` also logs connects and disconnects |
-| `BTNETPLAY_ALLOW_SAME_ADDRESS` | `0` | Testing only; see above |
+| `BTNETPLAY_ALLOW_SAME_ADDRESS` | `0` | Also report legacy/duplicate peers sharing the requester address |
+| `BTNETPLAY_SAME_ADDRESS_OVERRIDE` | empty | Testing only: rewrite same-address peers to this IP |
 
 ## License
 

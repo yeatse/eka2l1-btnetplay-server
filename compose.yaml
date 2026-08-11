@@ -10,9 +10,10 @@ services:
     environment:
       BTNETPLAY_HOST: "::"
       BTNETPLAY_PORT: "27138"
-      BTNETPLAY_LOG_LEVEL: info
-      # Testing aid: BTNETPLAY_ALLOW_SAME_ADDRESS=1 docker compose up -d
+      BTNETPLAY_LOG_LEVEL: "${BTNETPLAY_LOG_LEVEL:-info}"
+      # Enable when clients behind one public address must discover each other.
       BTNETPLAY_ALLOW_SAME_ADDRESS: "${BTNETPLAY_ALLOW_SAME_ADDRESS:-0}"
+      BTNETPLAY_SAME_ADDRESS_OVERRIDE: "${BTNETPLAY_SAME_ADDRESS_OVERRIDE:-}"
     healthcheck:
       test:
         - CMD
